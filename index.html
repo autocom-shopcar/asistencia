@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f172a">
+  <title>Asistencia</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Vincular la tablet con Shop Car (una sola vez) -->
+  <section id="pantalla-vincular" class="pantalla oculto">
+    <div class="tarjeta centro">
+      <h1>Asistencia</h1>
+      <p class="sub">Vincula esta tablet con Shop Car</p>
+      <ol class="pasos">
+        <li>En Shop Car entra a <b>Recursos Humanos → Asistencia → Tablets</b>.</li>
+        <li>Da de alta la tablet de esta localidad y copia el código de 8 letras.</li>
+        <li>Escríbelo aquí. Vence en 24 horas.</li>
+      </ol>
+      <form id="form-vincular">
+        <input id="codigo" class="codigo" maxlength="9" autocomplete="off" autocapitalize="characters" placeholder="ABCD2345" required>
+        <button class="btn primario grande" type="submit">Vincular</button>
+      </form>
+      <p id="msg-vincular" class="msg"></p>
+    </div>
+  </section>
+
+  <!-- Kiosco -->
+  <section id="pantalla-kiosco" class="pantalla oculto">
+    <header class="barra">
+      <div>
+        <div id="k-localidad" class="localidad">—</div>
+        <div id="k-tablet" class="tablet">—</div>
+      </div>
+      <div class="chips">
+        <span id="chip-red" class="chip">—</span>
+        <span id="chip-cola" class="chip oculto"></span>
+        <span id="chip-gps" class="chip">GPS…</span>
+        <button id="btn-admin" class="btn icono" title="Supervisor" aria-label="Supervisor">⚙</button>
+      </div>
+    </header>
+
+    <main class="kiosco">
+      <div class="camara">
+        <video id="video" playsinline muted autoplay></video>
+        <canvas id="lienzo-prueba" class="oculto"></canvas>
+        <div id="guia" class="guia"></div>
+        <div id="flecha" class="flecha oculto"></div>
+        <div id="cargando" class="cargando">Cargando reconocimiento facial…</div>
+      </div>
+      <aside class="lateral">
+        <div id="reloj" class="reloj">--:--</div>
+        <div id="fecha" class="fecha">—</div>
+        <div id="instruccion" class="instruccion">Acércate a la cámara</div>
+        <div id="detalle" class="detalle"></div>
+        <div id="ultimas" class="ultimas"></div>
+      </aside>
+    </main>
+
+    <!-- Confirmación -->
+    <div id="confirmar" class="capa oculto">
+      <div class="tarjeta confirmar">
+        <img id="c-foto" class="foto" alt="">
+        <div class="saludo">Hola,</div>
+        <div id="c-nombre" class="nombre">—</div>
+        <div id="c-puesto" class="puesto"></div>
+        <div id="c-aviso" class="aviso oculto"></div>
+        <div id="c-tipos" class="tipos"></div>
+        <div class="cuenta"><div id="c-barra"></div></div>
+        <button id="c-cancelar" class="btn texto">No soy yo · Cancelar</button>
+      </div>
+    </div>
+
+    <!-- Resultado -->
+    <div id="resultado" class="capa oculto">
+      <div class="tarjeta resultado">
+        <div id="r-icono" class="r-icono">✓</div>
+        <div id="r-titulo" class="r-titulo"></div>
+        <div id="r-texto" class="r-texto"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Supervisor -->
+  <section id="pantalla-admin" class="pantalla oculto">
+    <header class="barra">
+      <div>
+        <div class="localidad">Supervisor</div>
+        <div id="a-tablet" class="tablet"></div>
+      </div>
+      <button id="a-salir" class="btn">Volver al kiosco</button>
+    </header>
+    <nav class="pestanas">
+      <button data-tab="rostros" class="activa">Registrar rostros</button>
+      <button data-tab="ubicacion">Ubicación</button>
+      <button data-tab="tablet">Tablet</button>
+    </nav>
+
+    <div id="tab-rostros" class="tab">
+      <div class="dos">
+        <div>
+          <input id="buscar" class="buscar" placeholder="Buscar empleado…">
+          <div id="lista-emp" class="lista"></div>
+        </div>
+        <div id="registro" class="registro">
+          <p class="sub">Elige un empleado de la lista.</p>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-ubicacion" class="tab oculto">
+      <div class="tarjeta">
+        <h2>Geocerca de la localidad</h2>
+        <p class="sub">Las checadas que lleguen a más de este radio de la localidad se marcan como <b>fuera de zona</b> en Shop Car.</p>
+        <dl class="datos">
+          <dt>Guardada</dt><dd id="u-guardada">—</dd>
+          <dt>Posición de esta tablet</dt><dd id="u-actual">—</dd>
+        </dl>
+        <label>Radio (metros) <input id="u-radio" type="number" min="25" max="5000" step="25" value="300"></label>
+        <button id="u-fijar" class="btn primario">Usar la posición de esta tablet</button>
+        <p id="u-msg" class="msg"></p>
+      </div>
+    </div>
+
+    <div id="tab-tablet" class="tab oculto">
+      <div class="tarjeta">
+        <h2>Esta tablet</h2>
+        <dl class="datos">
+          <dt>Localidad</dt><dd id="t-localidad">—</dd>
+          <dt>Personal</dt><dd id="t-personal">—</dd>
+          <dt>Datos actualizados</dt><dd id="t-datos">—</dd>
+          <dt>Checadas sin enviar</dt><dd id="t-cola">—</dd>
+          <dt>Versión</dt><dd id="t-version">—</dd>
+        </dl>
+        <div class="botones">
+          <button id="t-actualizar" class="btn primario">Actualizar datos ahora</button>
+          <button id="t-completa" class="btn">Pantalla completa</button>
+          <button id="t-desvincular" class="btn peligro">Desvincular tablet</button>
+        </div>
+        <p id="t-msg" class="msg"></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- PIN -->
+  <div id="capa-pin" class="capa oculto">
+    <form id="form-pin" class="tarjeta pin">
+      <h2>PIN de supervisor</h2>
+      <input id="pin" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off" required>
+      <div class="botones">
+        <button type="button" id="pin-cancelar" class="btn">Cancelar</button>
+        <button type="submit" class="btn primario">Entrar</button>
+      </div>
+      <p id="pin-msg" class="msg"></p>
+    </form>
+  </div>
+
+  <script src="config.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
