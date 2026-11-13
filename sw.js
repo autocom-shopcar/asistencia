@@ -1,5 +1,6 @@
 // Service worker: instala la app y la deja funcionar sin internet (incluidos los modelos del rostro).
-const CACHE = 'asistencia-v1';
+// v2: identificación en el servidor (migración 237).
+const CACHE = 'asistencia-v2';
 const ARCHIVOS = ['./', 'index.html', 'styles.css', 'app.js', 'config.js', 'manifest.webmanifest',
   'lib/face-api.esm.js',
   'modelos/tiny_face_detector_model-weights_manifest.json', 'modelos/tiny_face_detector_model.bin',
@@ -10,8 +11,10 @@ const ARCHIVOS = ['./', 'index.html', 'styles.css', 'app.js', 'config.js', 'mani
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ARCHIVOS)).then(() => self.skipWaiting()));
 });
+// Solo borra cachés viejas de ESTA app: el origen (autocom-shopcar.github.io) lo
+// comparten otras apps, como Bandera 5.13.
 self.addEventListener('activate', e => {
-  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k !== CACHE).map(k => caches.delete(k))))
+  e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k => k.startsWith('asistencia') && k !== CACHE).map(k => caches.delete(k))))
     .then(() => self.clients.claim()));
 });
 // Modelos y librería: caché primero (pesan ~7 MB y no cambian). Lo demás: red primero.

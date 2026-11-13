@@ -96,7 +96,6 @@
     </header>
     <nav class="pestanas">
       <button data-tab="rostros" class="activa">Registrar rostros</button>
-      <button data-tab="ubicacion">Ubicación</button>
       <button data-tab="tablet">Tablet</button>
     </nav>
 
@@ -112,19 +111,7 @@
       </div>
     </div>
 
-    <div id="tab-ubicacion" class="tab oculto">
-      <div class="tarjeta">
-        <h2>Geocerca de la localidad</h2>
-        <p class="sub">Las checadas que lleguen a más de este radio de la localidad se marcan como <b>fuera de zona</b> en Shop Car.</p>
-        <dl class="datos">
-          <dt>Guardada</dt><dd id="u-guardada">—</dd>
-          <dt>Posición de esta tablet</dt><dd id="u-actual">—</dd>
-        </dl>
-        <label>Radio (metros) <input id="u-radio" type="number" min="25" max="5000" step="25" value="300"></label>
-        <button id="u-fijar" class="btn primario">Usar la posición de esta tablet</button>
-        <p id="u-msg" class="msg"></p>
-      </div>
-    </div>
+    <!-- La pestaña "Ubicación" se quitó: la geocerca se fija en Shop Car (migración 237). -->
 
     <div id="tab-tablet" class="tab oculto">
       <div class="tarjeta">

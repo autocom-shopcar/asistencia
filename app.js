@@ -1,26 +1,41 @@
 // Asistencia · kiosco de checadas con reconocimiento facial para Shop Car.
-// Una tablet fija por localidad. El rostro se reconoce EN la tablet (los
-// vectores de su personal se descargan y se guardan aquí), con prueba de vida
-// (parpadeo o giro de cabeza). Las checadas se guardan primero en la tablet y
-// se envían a Shop Car en cuanto hay red (cola con reintento).
+// Una tablet fija por localidad, con prueba de vida (parpadeo o giro de cabeza).
+//
+// Versión 2 (migración 237 de Shop Car): quien IDENTIFICA es el servidor, no la
+// tablet. La tablet solo calcula el vector de la cara que tiene enfrente y lo
+// manda; ya no descarga ni guarda los rostros del personal. El único vector que
+// llega a tocar el dispositivo es el de cada checada mientras espera en la cola
+// para enviarse (se borra en cuanto el servidor la acepta, y con el borrado por
+// desvinculación o por 72 h sin contacto).
+//  * Con señal: asistencia_kiosco_identificar dice quién es → prueba de vida →
+//    confirmar tipo. Al enviar, el servidor vuelve a identificar con el vector.
+//  * Sin señal: prueba de vida → tipo con botones (sin sugerencia) → se guarda
+//    con su vector y se confirma al volver la señal (si no se reconoce, en Shop
+//    Car queda como "sin reconocer").
 import * as faceapi from './lib/face-api.esm.js';
 
-const VERSION = 'asistencia-1';
+const VERSION = 'asistencia-2';
 const CFG = window.SHOPCAR;
 
-// Reconocimiento: distancia euclidiana entre vectores de 128 (menor = más parecido).
-const UMBRAL = 0.48;          // por encima no se acepta
-const MARGEN = 0.04;          // ventaja mínima sobre la segunda persona más parecida
-const UMBRAL_DUPLICADO = 0.42; // al registrar: ya existe alguien así de parecido
+// Misma persona antes y después de la prueba de vida (comparación local entre
+// las dos caras de esta misma checada, no contra un catálogo).
+const MISMA_PERSONA = 0.48;
 const MUESTRAS_REGISTRO = 5;
 const RETO_MS = 7000;
 const CONFIRMAR_MS = 6000;
+const CONFIRMAR_SIN_SENAL_MS = 15000; // sin señal no hay sugerencia: más tiempo para elegir
 const SIN_AUTO_MIN = 20;       // si checó hace menos, no se registra sola la siguiente
 const DESCANSO_MS = 90 * 1000; // tras atender a alguien, no volver a preguntarle por 90 s
 const descanso = new Map();    // empleado_id → hasta cuándo no se le vuelve a preguntar
+let descansoSinSenal = [];     // [{ descriptor, hasta }] solo en memoria, para el mismo caso sin señal
 const JORNADA_H = 16;          // checadas más viejas ya no cuentan para sugerir el tipo
 const REFRESCO_DATOS_MS = 10 * 60 * 1000;
 const ENVIO_MS = 20 * 1000;
+// Autodestrucción: si pasan 72 h sin hablar con el servidor (tablet perdida o
+// robada), se borra todo lo local, aunque se pierdan checadas sin enviar.
+const SIN_CONTACTO_MAX_MS = 72 * 3600 * 1000;
+const CLAVE_TOKEN = 'asistencia-token';
+const CLAVE_CONTACTO = 'asistencia-ultimo-contacto';
 
 const TIPOS = {
   ENTRADA: 'Entrada',
@@ -37,16 +52,19 @@ const TEXTO_RETO = {
 };
 
 // Modo de prueba (solo en esta computadora): ?prueba=<imagen> usa una foto en lugar
-// de la cámara; &vida=1 da por buena la prueba de vida.
+// de la cámara; &vida=1 da por buena la prueba de vida; &sinsenal=1 simula que no hay red.
 const LOCAL = ['localhost', '127.0.0.1'].includes(location.hostname);
 const PARAMS = new URLSearchParams(location.search);
 const PRUEBA = LOCAL ? PARAMS.get('prueba') : null;
 const PRUEBA_VIDA = LOCAL && PARAMS.get('vida') === '1';
+const PRUEBA_SIN_SENAL = LOCAL && PARAMS.get('sinsenal') === '1';
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const espera = (ms) => new Promise((r) => setTimeout(r, ms));
 const hora = (d) => new Date(d).toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+// Vector a JSON: 128 números con 5 decimales (lo que esperan las funciones del servidor).
+const vector = (d) => Array.from(d, (x) => Number(x.toFixed(5)));
 
 // ------------------------------------------------------------------ IndexedDB
 const db = await new Promise((ok, mal) => {
@@ -71,8 +89,55 @@ const kvGet = (k) => tx('kv', 'readonly', (s) => s.get(k));
 const kvSet = (k, v) => tx('kv', 'readwrite', (s) => s.put(v, k));
 const todos = (store) => tx(store, 'readonly', (s) => s.getAll());
 
+// ------------------------------------------------------------------ borrado local
+// Borra TODO lo de esta app en la tablet: token, IndexedDB "asistencia" y las
+// cachés de su service worker. Se usa si Shop Car desvinculó la tablet (code
+// 28000) o si pasaron 72 h sin contacto.
+// OJO: en autocom-shopcar.github.io todas las apps comparten el mismo origen
+// (localStorage y cachés), así que solo se borra lo que empieza con
+// "asistencia"; nunca localStorage.clear() ni todas las cachés (sería borrar
+// también lo de Bandera 5.13 u otras apps).
+const esDeAsistencia = (clave) => clave.startsWith('asistencia');
+function borrarLocalStorage(conservar = []) {
+  for (let i = localStorage.length - 1; i >= 0; i--) {
+    const k = localStorage.key(i);
+    if (esDeAsistencia(k) && !conservar.includes(k)) localStorage.removeItem(k);
+  }
+}
+let borrada = false;
+async function borrarTodo(motivo) {
+  if (borrada) return;
+  borrada = true;
+  modo = 'pausa';
+  try { borrarLocalStorage(); } catch { /* sin almacenamiento */ }
+  try {
+    await Promise.all(['kv', 'cola', 'locales'].map((s) => tx(s, 'readwrite', (o) => o.clear())));
+  } catch { /* la base ya no está */ }
+  try {
+    if ('caches' in window) await Promise.all((await caches.keys()).filter(esDeAsistencia).map((k) => caches.delete(k)));
+  } catch { /* sin cachés */ }
+  try { $('video').srcObject?.getTracks().forEach((t) => t.stop()); } catch { /* sin cámara */ }
+  pantalla('pantalla-kiosco');
+  for (const id of ['confirmar', 'resultado', 'capa-pin']) $(id).classList.add('oculto');
+  $('cargando').classList.remove('oculto');
+  $('cargando').innerHTML = `${motivo}<br>Se borraron los datos de esta tablet.<br><br><button class="btn primario" id="re-vincular">Vincular otra vez</button>`;
+  $('re-vincular').onclick = () => location.reload();
+}
+const MSG_DESVINCULADA = 'Esta tablet fue desvinculada desde Shop Car.';
+const MSG_SIN_CONTACTO = 'Esta tablet pasó más de 72 horas sin conectarse a Shop Car.';
+
+function revisarSinContacto() {
+  const ultimo = Number(localStorage.getItem(CLAVE_CONTACTO) || 0);
+  if (token && ultimo && Date.now() - ultimo > SIN_CONTACTO_MAX_MS) {
+    borrarTodo(MSG_SIN_CONTACTO);
+    return true;
+  }
+  return false;
+}
+
 // ------------------------------------------------------------------ Shop Car
 async function rpc(nombre, args) {
+  if (PRUEBA_SIN_SENAL && nombre !== 'asistencia_kiosco_vincular') throw new TypeError('Sin señal (prueba)');
   const r = await fetch(`${CFG.url}/rest/v1/rpc/${nombre}`, {
     method: 'POST',
     headers: { apikey: CFG.anonKey, Authorization: `Bearer ${CFG.anonKey}`, 'Content-Type': 'application/json' },
@@ -81,29 +146,48 @@ async function rpc(nombre, args) {
   const texto = await r.text();
   const cuerpo = texto ? JSON.parse(texto) : null;
   if (!r.ok) {
+    // Incluye el PIN incorrecto (401) y la tablet bloqueada por intentos (423):
+    // el servidor regresa { code, message } y aquí se trata como error.
     const e = new Error(cuerpo?.message || `Error ${r.status}`);
     e.code = cuerpo?.code;
+    // Tablet desvinculada en Shop Car: borrar todo (no aplica al vincular, que
+    // usa el mismo código para "código no válido").
+    if (e.code === '28000' && 'p_token' in args) borrarTodo(MSG_DESVINCULADA);
     throw e;
   }
+  // Contacto exitoso con el servidor: reinicia la cuenta de 72 h.
+  if ('p_token' in args || nombre === 'asistencia_kiosco_vincular') localStorage.setItem(CLAVE_CONTACTO, String(Date.now()));
   return cuerpo;
 }
-const desvinculada = (e) => e?.code === '28000';
+const sinSenal = (e) => e instanceof TypeError; // fetch falló: no hay red
 
 // ------------------------------------------------------------------ estado
-let token = localStorage.getItem('asistencia-token');
-let datos = null;          // { kiosco, empleados, recientes, descargado_at }
-let indice = [];           // [{ emp, descriptores: Float32Array[] }]
+let token = localStorage.getItem(CLAVE_TOKEN);
+let datos = null;          // { kiosco, empleados (con tiene_rostro), recientes, descargado_at }
 let gps = null;            // { latitud, longitud, precision_m, at }
 let pinSupervisor = null;  // solo mientras está abierto el modo supervisor
 let modo = 'kiosco';       // kiosco | registro | pausa
-let enLinea = navigator.onLine;
+let enLinea = navigator.onLine && !PRUEBA_SIN_SENAL;
 
 function pantalla(id) {
   for (const p of document.querySelectorAll('.pantalla')) p.classList.toggle('oculto', p.id !== id);
 }
+const conRostro = () => (datos?.empleados || []).filter((e) => e.tiene_rostro).length;
+
+// Al arrancar la versión 2: la versión 1 guardaba los vectores de todo el
+// personal (datos.empleados[].descriptores) y vectores sueltos en la cola. Se
+// borran aquí; los de la cola v1 no sirven (no traen "descriptor") y el
+// servidor ya no los aceptaría.
+async function limpiarVectoresViejos() {
+  const viejos = await kvGet('datos');
+  if (viejos?.empleados?.some((e) => 'descriptores' in e)) await tx('kv', 'readwrite', (s) => s.delete('datos'));
+  const colaV1 = (await todos('cola')).filter((c) => !Array.isArray(c.descriptor));
+  if (colaV1.length) await tx('cola', 'readwrite', (s) => colaV1.forEach((c) => s.delete(c.id)));
+  // Cualquier otra clave de Asistencia en localStorage (solo las nuestras).
+  borrarLocalStorage([CLAVE_TOKEN, CLAVE_CONTACTO]);
+}
 
 // ------------------------------------------------------------------ vincular
-
 $('form-vincular').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   const msg = $('msg-vincular');
@@ -112,7 +196,7 @@ $('form-vincular').addEventListener('submit', async (ev) => {
   try {
     const r = await rpc('asistencia_kiosco_vincular', { p_codigo: $('codigo').value, p_version: VERSION });
     token = r.token;
-    localStorage.setItem('asistencia-token', token);
+    localStorage.setItem(CLAVE_TOKEN, token);
     await descargarDatos();
     await abrirKiosco();
   } catch (e) {
@@ -123,56 +207,46 @@ $('form-vincular').addEventListener('submit', async (ev) => {
 async function abrirKiosco() {
   pantalla('pantalla-kiosco');
   datos = (await kvGet('datos')) || null;
-  if (datos) prepararIndice();
   pintarEncabezado();
   iniciarGps();
   pedirPantallaEncendida();
   try {
     await descargarDatos();
   } catch (e) {
-    if (desvinculada(e)) return mostrarDesvinculada();
+    if (borrada) return;
     if (!datos) {
       $('cargando').textContent = 'Sin conexión y sin datos guardados. Conecta la tablet a internet.';
       return;
     }
+    // Arrancó sin señal: que el indicador lo diga desde el principio.
+    if (sinSenal(e)) enLinea = false;
   }
+  pintarRed();
   await cargarModelos();
   await abrirCamara();
   bucle();
-  setInterval(() => descargarDatos().catch((e) => desvinculada(e) && mostrarDesvinculada()), REFRESCO_DATOS_MS);
+  setInterval(() => descargarDatos().catch(() => {}), REFRESCO_DATOS_MS);
   setInterval(enviarCola, ENVIO_MS);
+  setInterval(revisarSinContacto, 10 * 60 * 1000);
   addEventListener('online', () => { enLinea = true; pintarRed(); enviarCola(); });
   addEventListener('offline', () => { enLinea = false; pintarRed(); });
   document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && enviarCola());
   enviarCola();
 }
 
-function mostrarDesvinculada() {
-  $('cargando').classList.remove('oculto');
-  $('cargando').innerHTML = 'Esta tablet ya no está vinculada a Shop Car.<br>Pide un código nuevo a tu supervisor.<br><br><button class="btn primario" id="re-vincular">Vincular otra vez</button>';
-  $('re-vincular').onclick = () => { localStorage.removeItem('asistencia-token'); location.reload(); };
-}
-
 async function descargarDatos() {
   const r = await rpc('asistencia_kiosco_datos', { p_token: token, p_version: VERSION });
   datos = { ...r, descargado_at: new Date().toISOString() };
   await kvSet('datos', datos);
-  prepararIndice();
   pintarEncabezado();
   enLinea = true;
   pintarRed();
 }
 
-function prepararIndice() {
-  indice = datos.empleados
-    .filter((e) => Array.isArray(e.descriptores) && e.descriptores.length)
-    .map((e) => ({ emp: e, descriptores: e.descriptores.map((d) => Float32Array.from(d)) }));
-}
-
 function pintarEncabezado() {
   if (!datos) return;
   $('k-localidad').textContent = datos.kiosco.localidad;
-  $('k-tablet').textContent = `${datos.kiosco.nombre} · ${indice.length} de ${datos.empleados.length} con rostro`;
+  $('k-tablet').textContent = `${datos.kiosco.nombre} · ${conRostro()} de ${datos.empleados.length} con rostro`;
   $('a-tablet').textContent = `${datos.kiosco.localidad} · ${datos.kiosco.nombre}`;
 }
 
@@ -189,11 +263,11 @@ function iniciarReloj() {
 }
 
 async function pintarRed() {
+  if (borrada) return;
   const chip = $('chip-red');
   chip.textContent = enLinea ? 'En línea' : 'Sin red';
   chip.className = `chip ${enLinea ? 'ok' : 'mal'}`;
   const n = (await todos('cola')).length;
-  $('chip-cola').classList.toggle('oculto', n === 0);
   $('chip-cola').textContent = `${n} por enviar`;
   $('chip-cola').className = n ? 'chip mal' : 'chip oculto';
 }
@@ -205,7 +279,6 @@ function iniciarGps() {
       gps = { latitud: p.coords.latitude, longitud: p.coords.longitude, precision_m: Math.round(p.coords.accuracy), at: Date.now() };
       $('chip-gps').textContent = `GPS ±${gps.precision_m} m`;
       $('chip-gps').className = 'chip ok';
-      if (!$('tab-ubicacion').classList.contains('oculto')) pintarUbicacion();
     },
     () => { $('chip-gps').textContent = 'GPS sin permiso'; $('chip-gps').className = 'chip mal'; },
     { enableHighAccuracy: true, maximumAge: 60000, timeout: 30000 },
@@ -293,20 +366,22 @@ function caraPrincipal(dets) {
   return { cara: orden[0], varias };
 }
 
-function identificar(descriptor) {
-  let mejor = null, segunda = Infinity;
-  for (const p of indice) {
-    let d = Infinity;
-    for (const v of p.descriptores) d = Math.min(d, faceapi.euclideanDistance(descriptor, v));
-    if (!mejor || d < mejor.d) {
-      if (mejor) segunda = Math.min(segunda, mejor.d);
-      mejor = { emp: p.emp, d };
-    } else {
-      segunda = Math.min(segunda, d);
+// ¿Quién es? Lo decide el servidor. Regresa { quien } si lo reconoció,
+// { noReconocido: true } si no, o { sinSenal: true } si no hay red.
+async function identificar(descriptor) {
+  try {
+    const r = await rpc('asistencia_kiosco_identificar', { p_token: token, p_descriptor: vector(descriptor) });
+    enLinea = true;
+    if (!r?.reconocido) return { noReconocido: true };
+    return { quien: { emp: r.empleado, d: r.distancia } };
+  } catch (e) {
+    if (sinSenal(e)) {
+      enLinea = false;
+      pintarRed();
+      return { sinSenal: true };
     }
+    throw e;
   }
-  if (!mejor || mejor.d > UMBRAL || segunda - mejor.d < MARGEN) return null;
-  return mejor;
 }
 
 function foto(det) {
@@ -339,6 +414,7 @@ function flecha(reto) {
 
 async function bucle() {
   for (;;) {
+    if (borrada) return;
     if (modo === 'kiosco' && datos) {
       try { await paso(); } catch (e) { console.error(e); }
     }
@@ -354,7 +430,7 @@ async function paso() {
     flecha(null);
     // Deja leer el último aviso ("No te reconozco", etc.) antes de seguir.
     if (estado.pausaHasta > Date.now()) return;
-    if (!indice.length) return instruccion('Sin rostros registrados', 'El supervisor debe registrar al personal (⚙).');
+    if (!conRostro()) return instruccion('Sin rostros registrados', 'El supervisor debe registrar al personal (⚙).');
     if (!cara) { estado.frontales = 0; return instruccion('Acércate a la cámara', 'Mira de frente, una persona a la vez.'); }
     if (varias) return instruccion('Una persona a la vez', '', 'cara');
     const m = medidas(cara);
@@ -365,22 +441,32 @@ async function paso() {
 
     const conDesc = await faceapi.detectSingleFace(fuente, opcionesDet).withFaceLandmarks().withFaceDescriptor();
     if (!conDesc) return;
-    const quien = identificar(conDesc.descriptor);
-    if (!quien) {
+    instruccion('Un momento…', '', 'cara');
+    const id = await identificar(conDesc.descriptor);
+    if (id.noReconocido) {
       fallos++;
       estado = { fase: 'espera', pausaHasta: Date.now() + 2500 };
       instruccion('No te reconozco', fallos >= 3 ? 'Avisa a tu supervisor para registrar tu rostro.' : 'Acércate, quítate gorra o lentes oscuros y mira de frente.', 'reto');
       return;
     }
     fallos = 0;
+    const quien = id.quien ?? null; // null = sin señal: se identificará al enviar
     // Recién atendido (checó o canceló): no volver a preguntarle mientras sigue frente a la tablet.
-    if ((descanso.get(quien.emp.id) || 0) > Date.now()) {
-      estado = { fase: 'espera', pausaHasta: Date.now() + 4000 };
-      return instruccion(`Listo, ${quien.emp.nombre.split(' ')[0]}`, 'Tu checada ya quedó. Puedes retirarte.', 'bien');
+    const ahora = Date.now();
+    descansoSinSenal = descansoSinSenal.filter((x) => x.hasta > ahora);
+    const enDescanso = quien
+      ? (descanso.get(quien.emp.id) || 0) > ahora
+      : descansoSinSenal.some((x) => faceapi.euclideanDistance(x.descriptor, conDesc.descriptor) <= MISMA_PERSONA);
+    if (enDescanso) {
+      estado = { fase: 'espera', pausaHasta: ahora + 4000 };
+      return instruccion(quien ? `Listo, ${quien.emp.nombre.split(' ')[0]}` : 'Listo', 'Tu checada ya quedó. Puedes retirarte.', 'bien');
     }
     const reto = PRUEBA_VIDA ? 'PARPADEO' : RETOS[Math.floor(Math.random() * RETOS.length)];
-    estado = { fase: 'reto', quien, reto, inicio: Date.now(), foto: foto(conDesc), parpadeos: 0, ojosAbiertos: true, cumplido: PRUEBA_VIDA };
-    instruccion(TEXTO_RETO[reto], `Prueba de vida · ${estado.quien.emp.nombre.split(' ')[0]}`, 'reto');
+    estado = {
+      fase: 'reto', quien, reto, inicio: ahora, foto: foto(conDesc), antes: conDesc.descriptor,
+      parpadeos: 0, ojosAbiertos: true, cumplido: PRUEBA_VIDA,
+    };
+    instruccion(TEXTO_RETO[reto], quien ? `Prueba de vida · ${quien.emp.nombre.split(' ')[0]}` : 'Prueba de vida · sin señal', 'reto');
     flecha(reto);
     return;
   }
@@ -406,21 +492,22 @@ async function paso() {
       if (estado.cumplido) { flecha(null); instruccion('Ahora mira de frente', '', 'bien'); }
       return;
     }
-    // Cumplió: confirmar que sigue siendo la misma persona, ya de frente.
+    // Cumplió: ya de frente, confirmar LOCALMENTE que es la misma cara de antes
+    // de la prueba (sin otra llamada al servidor). Este vector, el de después
+    // de la prueba de vida, es el que se manda con la checada.
     if (!deFrente(m)) return;
     const conDesc = await faceapi.detectSingleFace(fuente, opcionesDet).withFaceLandmarks().withFaceDescriptor();
     if (!conDesc) return;
-    const otra = identificar(conDesc.descriptor);
-    if (!otra || otra.emp.id !== estado.quien.emp.id) {
+    if (faceapi.euclideanDistance(estado.antes, conDesc.descriptor) > MISMA_PERSONA) {
       estado = { fase: 'espera', pausaHasta: Date.now() + 2500 };
       return instruccion('No se pudo confirmar', 'Vuelve a intentarlo, una persona a la vez.', 'reto');
     }
-    const quien = { emp: estado.quien.emp, d: Math.max(estado.quien.d, otra.d) };
-    const datosChecada = { quien, reto: estado.reto, foto: estado.foto };
+    const datosChecada = { quien: estado.quien, reto: estado.reto, foto: estado.foto, descriptor: conDesc.descriptor };
     estado = { fase: 'confirmar' };
     instruccion('¡Listo!', '', 'bien');
     await confirmar(datosChecada);
-    descanso.set(quien.emp.id, Date.now() + DESCANSO_MS);
+    if (datosChecada.quien) descanso.set(datosChecada.quien.emp.id, Date.now() + DESCANSO_MS);
+    else descansoSinSenal.push({ descriptor: datosChecada.descriptor, hasta: Date.now() + DESCANSO_MS });
     estado = { fase: 'espera', pausaHasta: Date.now() + 2500 };
   }
 }
@@ -436,14 +523,17 @@ async function ultimasDe(empleadoId) {
     .sort((a, b) => new Date(b.checada_at) - new Date(a.checada_at));
 }
 
-function confirmar({ quien, reto, foto: imagen }) {
+function confirmar({ quien, reto, foto: imagen, descriptor }) {
   return new Promise(async (listo) => {
-    const ultimas = await ultimasDe(quien.emp.id);
-    const ultima = ultimas[0];
-    const sugerido = ultima ? SIGUIENTE[ultima.tipo] : 'ENTRADA';
+    // Sin señal no sabemos quién es: no hay nombre ni sugerencia, y nunca se
+    // registra solo (si no toca nada, se cancela).
+    const ultima = quien ? (await ultimasDe(quien.emp.id))[0] : null;
+    const sugerido = !quien ? null : ultima ? SIGUIENTE[ultima.tipo] : 'ENTRADA';
     $('c-foto').src = imagen;
-    $('c-nombre').textContent = quien.emp.nombre;
-    $('c-puesto').textContent = [quien.emp.puesto, quien.emp.no_empleado && `No. ${quien.emp.no_empleado}`].filter(Boolean).join(' · ');
+    $('c-nombre').textContent = quien ? quien.emp.nombre : 'Sin señal';
+    $('c-puesto').textContent = quien
+      ? [quien.emp.puesto, quien.emp.no_empleado && `No. ${quien.emp.no_empleado}`].filter(Boolean).join(' · ')
+      : 'Elige el tipo de checada. Tu nombre se confirmará al tener señal.';
     const aviso = $('c-aviso');
     // Checó hace poco: no se registra nada solo; tiene que tocar el tipo.
     const minutos = ultima ? Math.floor((Date.now() - new Date(ultima.checada_at).getTime()) / 60000) : null;
@@ -461,7 +551,7 @@ function confirmar({ quien, reto, foto: imagen }) {
       terminado = true;
       clearTimeout(reloj);
       $('confirmar').classList.add('oculto');
-      if (tipo) await registrar({ quien, reto, imagen, tipo });
+      if (tipo) await registrar({ quien, reto, imagen, tipo, descriptor });
       listo();
     };
     for (const [tipo, nombre] of Object.entries(TIPOS)) {
@@ -471,47 +561,60 @@ function confirmar({ quien, reto, foto: imagen }) {
       b.onclick = () => fin(tipo);
       cont.appendChild(b);
     }
+    $('c-cancelar').textContent = quien ? 'No soy yo · Cancelar' : 'Cancelar';
     $('c-cancelar').onclick = () => fin(null);
 
-    // Si no toca nada, se registra lo sugerido (salvo que acabe de checar).
+    // Si no toca nada: con señal se registra lo sugerido (salvo que acabe de
+    // checar); sin señal, se cancela.
+    const ms = quien ? CONFIRMAR_MS : CONFIRMAR_SIN_SENAL_MS;
     const barra = $('c-barra');
     barra.style.transition = 'none';
     barra.style.transform = 'scaleX(1)';
     requestAnimationFrame(() => {
-      barra.style.transition = `transform ${CONFIRMAR_MS}ms linear`;
+      barra.style.transition = `transform ${ms}ms linear`;
       barra.style.transform = 'scaleX(0)';
     });
-    const reloj = setTimeout(() => fin(reciente ? null : sugerido), CONFIRMAR_MS);
+    const reloj = setTimeout(() => fin(quien && !reciente ? sugerido : null), ms);
     $('confirmar').classList.remove('oculto');
     sonido(880);
   });
 }
 
-async function registrar({ quien, reto, imagen, tipo }) {
+async function registrar({ quien, reto, imagen, tipo, descriptor }) {
   const ahora = new Date();
   const fresco = gps && Date.now() - gps.at < 10 * 60 * 1000 ? gps : null;
+  // Cada checada lleva el vector de la cara (después de la prueba de vida): el
+  // servidor decide quién es; no se manda empleado_id (lo ignoraría).
   const checada = {
     id: crypto.randomUUID(),
-    empleado_id: quien.emp.id,
     tipo,
     checada_at: ahora.toISOString(),
     latitud: fresco?.latitud ?? null,
     longitud: fresco?.longitud ?? null,
     precision_m: fresco?.precision_m ?? null,
-    similitud: Number(quien.d.toFixed(3)),
     prueba_vida: reto,
     foto: imagen,
+    descriptor: vector(descriptor),
   };
   await tx('cola', 'readwrite', (s) => s.put(checada));
-  await tx('locales', 'readwrite', (s) => s.put({ id: checada.id, empleado_id: checada.empleado_id, tipo, checada_at: checada.checada_at, nombre: quien.emp.nombre }));
+  // "Últimas checadas" en pantalla y sugerencia del siguiente tipo (sin vector).
+  await tx('locales', 'readwrite', (s) => s.put({
+    id: checada.id, empleado_id: quien?.emp.id ?? null, tipo, checada_at: checada.checada_at,
+    nombre: quien?.emp.nombre ?? 'Por confirmar',
+  }));
   await limpiarLocales();
   pintarUltimas();
   pintarRed();
 
-  const nombre = quien.emp.nombre.split(' ')[0];
-  const saludo = tipo === 'ENTRADA' ? (ahora.getHours() < 12 ? 'Buenos días' : 'Buenas tardes') : tipo === 'SALIDA' ? 'Hasta luego' : 'Provecho';
-  resultado(true, `${TIPOS[tipo]} registrada`, `${quien.emp.nombre} · ${hora(ahora)}`);
-  hablar(`${TIPOS[tipo]} registrada. ${saludo}, ${nombre}.`);
+  if (quien) {
+    const nombre = quien.emp.nombre.split(' ')[0];
+    const saludo = tipo === 'ENTRADA' ? (ahora.getHours() < 12 ? 'Buenos días' : 'Buenas tardes') : tipo === 'SALIDA' ? 'Hasta luego' : 'Provecho';
+    resultado(true, `${TIPOS[tipo]} registrada`, `${quien.emp.nombre} · ${hora(ahora)}`);
+    hablar(`${TIPOS[tipo]} registrada. ${saludo}, ${nombre}.`);
+  } else {
+    resultado(true, 'Checada guardada', `${TIPOS[tipo]} · ${hora(ahora)}. Se confirmará al tener señal.`);
+    hablar(`${TIPOS[tipo]} guardada. Se confirmará al tener señal.`);
+  }
   enviarCola();
   await espera(2600);
   $('resultado').classList.add('oculto');
@@ -559,23 +662,34 @@ function hablar(texto) {
 }
 
 // ------------------------------------------------------------------ envío
+const MAX_INTENTOS = 5;
 let enviando = false;
 async function enviarCola() {
-  if (enviando || !token) return;
+  if (enviando || !token || borrada) return;
   enviando = true;
   try {
     for (;;) {
       const cola = (await todos('cola')).sort((a, b) => a.checada_at.localeCompare(b.checada_at)).slice(0, 50);
       if (!cola.length) break;
-      const aceptadas = await rpc('asistencia_kiosco_checar', { p_token: token, p_checadas: cola });
-      // Lo que la base no aceptó (p. ej. empleado dado de baja) se descarta para no trabar la cola.
-      await tx('cola', 'readwrite', (s) => cola.forEach((c) => s.delete(c.id)));
-      if (aceptadas.length < cola.length) console.warn('Checadas no aceptadas:', cola.filter((c) => !aceptadas.includes(c.id)));
+      // Al servidor solo va lo que espera (sin el contador de intentos local).
+      const lote = cola.map(({ intentos, ...c }) => c);
+      const aceptadas = new Set(await rpc('asistencia_kiosco_checar', { p_token: token, p_checadas: lote }));
+      // Las aceptadas (reconocidas o "sin reconocer") salen de la cola junto con
+      // su vector. Las que el servidor rechazó (mal formadas) se reintentan
+      // unas veces y luego se descartan para no trabar la cola.
+      await tx('cola', 'readwrite', (s) => cola.forEach((c) => {
+        if (aceptadas.has(c.id)) s.delete(c.id);
+        else if ((c.intentos || 0) + 1 >= MAX_INTENTOS) s.delete(c.id);
+        else s.put({ ...c, intentos: (c.intentos || 0) + 1 });
+      }));
       enLinea = true;
+      if (aceptadas.size < cola.length) {
+        console.warn('Checadas no aceptadas:', cola.filter((c) => !aceptadas.has(c.id)).map((c) => c.id));
+        break; // no repetir el mismo lote en este ciclo
+      }
     }
   } catch (e) {
-    if (desvinculada(e)) mostrarDesvinculada();
-    enLinea = navigator.onLine && !(e instanceof TypeError);
+    enLinea = !sinSenal(e) && navigator.onLine;
   } finally {
     enviando = false;
     pintarRed();
@@ -594,12 +708,14 @@ $('form-pin').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   $('pin-msg').textContent = 'Verificando…';
   try {
+    // PIN incorrecto → 401; bloqueada por 5 intentos → 423. Ambos llegan como
+    // error con el mensaje del servidor (cuántos intentos quedan, etc.).
     await rpc('asistencia_kiosco_verificar_pin', { p_token: token, p_pin: $('pin').value });
     pinSupervisor = $('pin').value;
     $('capa-pin').classList.add('oculto');
     abrirSupervisor();
   } catch (e) {
-    $('pin-msg').textContent = navigator.onLine ? e.message : 'El modo supervisor necesita internet.';
+    $('pin-msg').textContent = sinSenal(e) ? 'El modo supervisor necesita internet.' : e.message;
   }
 });
 
@@ -608,7 +724,7 @@ function abrirSupervisor() {
   pantalla('pantalla-admin');
   pestana('rostros');
   pintarListaEmpleados();
-  // Si nadie lo cierra, regresa solo al kiosco.
+  // Si nadie lo cierra, regresa solo al kiosco (el PIN vale 30 min en el servidor).
   clearTimeout(abrirSupervisor.t);
   abrirSupervisor.t = setTimeout(salirSupervisor, 10 * 60 * 1000);
 }
@@ -622,10 +738,10 @@ function salirSupervisor() {
 }
 $('a-salir').onclick = salirSupervisor;
 
+// La pestaña "Ubicación" se quitó: la geocerca se fija en Shop Car.
 function pestana(id) {
   for (const b of document.querySelectorAll('.pestanas button')) b.classList.toggle('activa', b.dataset.tab === id);
   for (const t of document.querySelectorAll('.tab')) t.classList.toggle('oculto', t.id !== `tab-${id}`);
-  if (id === 'ubicacion') pintarUbicacion();
   if (id === 'tablet') pintarTablet();
   if (id !== 'rostros') detenerRegistro();
 }
@@ -640,7 +756,7 @@ function pintarListaEmpleados() {
   $('lista-emp').innerHTML = lista.map((e) => `
     <button data-id="${e.id}" class="${empleadoSel?.id === e.id ? 'sel' : ''}">
       <span>${esc(e.nombre)}<small>${esc([e.puesto, e.no_empleado && 'No. ' + e.no_empleado].filter(Boolean).join(' · '))}</small></span>
-      <span class="marca ${e.descriptores?.length ? 'si' : 'no'}">${e.descriptores?.length ? 'Registrado' : 'Sin rostro'}</span>
+      <span class="marca ${e.tiene_rostro ? 'si' : 'no'}">${e.tiene_rostro ? 'Registrado' : 'Sin rostro'}</span>
     </button>`).join('') || '<p class="sub" style="padding:12px">Sin resultados.</p>';
   for (const b of $('lista-emp').querySelectorAll('button')) {
     b.onclick = () => elegirEmpleado(datos.empleados.find((e) => e.id === Number(b.dataset.id)));
@@ -651,11 +767,13 @@ function elegirEmpleado(emp) {
   detenerRegistro();
   empleadoSel = emp;
   pintarListaEmpleados();
+  // El consentimiento firmado se sube en Shop Car; el servidor no deja
+  // registrar el rostro sin él (y regresa el aviso si falta).
   $('registro').innerHTML = `
     <h2>${esc(emp.nombre)}</h2>
-    <p class="sub">${emp.descriptores?.length ? 'Ya tiene rostro registrado. Registrarlo otra vez lo reemplaza.' : 'Aún no tiene rostro registrado.'}</p>
+    <p class="sub">${emp.tiene_rostro ? 'Ya tiene rostro registrado. Registrarlo otra vez lo reemplaza.' : 'Aún no tiene rostro registrado.'}</p>
     <label class="consent"><input type="checkbox" id="r-consent">
-      <span>El empleado firmó el <b>consentimiento para el uso de sus datos biométricos</b> (rostro) para control de asistencia.</span></label>
+      <span>El empleado firmó el <b>consentimiento para el uso de sus datos biométricos</b> y ya está subido en Shop Car (Asistencia → Personal y rostros).</span></label>
     <div class="vista oculto" id="r-vista"></div>
     <div class="progreso oculto" id="r-progreso">${'<span></span>'.repeat(MUESTRAS_REGISTRO)}</div>
     <p id="r-msg" class="msg"></p>
@@ -688,6 +806,7 @@ async function tomarMuestras(emp) {
   $('r-vista').classList.toggle('oculto', !!PRUEBA);
   $('r-progreso').classList.remove('oculto');
   const barras = $('r-progreso').querySelectorAll('span');
+  // Las muestras viven solo en memoria hasta mandarlas; nunca se guardan aquí.
   const muestras = [];
   let ultima = 0;
   const limite = Date.now() + 60000;
@@ -715,24 +834,14 @@ async function tomarMuestras(emp) {
   }
   detenerRegistro();
 
-  // ¿Ya existe otra persona con este rostro?
-  for (const p of indice) {
-    if (p.emp.id === emp.id) continue;
-    const d = Math.min(...muestras.flatMap((m) => p.descriptores.map((v) => faceapi.euclideanDistance(m, v))));
-    if (d < UMBRAL_DUPLICADO) {
-      msg.textContent = `Este rostro se parece mucho al de ${p.emp.nombre}, que ya está registrado. Revisa que sea la persona correcta.`;
-      $('r-iniciar').disabled = false;
-      $('r-consent').disabled = false;
-      return;
-    }
-  }
-
+  // El chequeo de "rostro duplicado" (otra persona ya registrada con esta
+  // cara) lo hace ahora el servidor y regresa el error con su nombre.
   try {
     await rpc('asistencia_kiosco_registrar_rostro', {
       p_token: token,
       p_pin: pinSupervisor,
       p_empleado_id: emp.id,
-      p_descriptores: muestras.map((m) => Array.from(m, (x) => Number(x.toFixed(5)))),
+      p_descriptores: muestras.map(vector),
       p_consentimiento: true,
     });
     await descargarDatos();
@@ -741,51 +850,16 @@ async function tomarMuestras(emp) {
     empleadoSel = datos.empleados.find((e) => e.id === emp.id);
     pintarListaEmpleados();
   } catch (e) {
-    msg.textContent = e.message;
+    msg.textContent = sinSenal(e) ? 'Sin internet: el registro de rostros necesita señal.' : e.message;
     $('r-iniciar').disabled = false;
     $('r-consent').disabled = false;
   }
 }
 
-// --- ubicación
-function pintarUbicacion() {
-  const k = datos.kiosco;
-  $('u-guardada').textContent = k.latitud != null ? `${k.latitud.toFixed(6)}, ${k.longitud.toFixed(6)} · radio ${k.radio_m} m` : 'Sin ubicación guardada';
-  $('u-radio').value = k.radio_m ?? 300;
-  if (gps) {
-    const lejos = k.latitud != null ? distanciaM(gps, k) : null;
-    $('u-actual').textContent = `${gps.latitud.toFixed(6)}, ${gps.longitud.toFixed(6)} · ±${gps.precision_m} m${lejos != null ? ` · a ${Math.round(lejos)} m de la guardada` : ''}`;
-  } else {
-    $('u-actual').textContent = 'Esperando GPS…';
-  }
-}
-function distanciaM(a, b) {
-  const r = (x) => (x * Math.PI) / 180;
-  const h = Math.sin(r(b.latitud - a.latitud) / 2) ** 2 + Math.cos(r(a.latitud)) * Math.cos(r(b.latitud)) * Math.sin(r(b.longitud - a.longitud) / 2) ** 2;
-  return 2 * 6371000 * Math.asin(Math.sqrt(h));
-}
-$('u-fijar').onclick = async () => {
-  const msg = $('u-msg');
-  msg.className = 'msg';
-  if (!gps) { msg.textContent = 'Aún no hay posición GPS.'; return; }
-  if (gps.precision_m > 100) { msg.textContent = `La precisión del GPS es baja (±${gps.precision_m} m). Acerca la tablet a una ventana y espera.`; return; }
-  try {
-    await rpc('asistencia_kiosco_fijar_ubicacion', {
-      p_token: token, p_pin: pinSupervisor, p_latitud: gps.latitud, p_longitud: gps.longitud, p_radio_m: Number($('u-radio').value) || 300,
-    });
-    await descargarDatos();
-    pintarUbicacion();
-    msg.className = 'msg ok';
-    msg.textContent = 'Ubicación de la localidad guardada.';
-  } catch (e) {
-    msg.textContent = e.message;
-  }
-};
-
 // --- tablet
 async function pintarTablet() {
   $('t-localidad').textContent = `${datos.kiosco.localidad} · ${datos.kiosco.nombre}`;
-  $('t-personal').textContent = `${datos.empleados.length} activos · ${indice.length} con rostro`;
+  $('t-personal').textContent = `${datos.empleados.length} activos · ${conRostro()} con rostro`;
   $('t-datos').textContent = new Date(datos.descargado_at).toLocaleString('es-MX');
   $('t-cola').textContent = String((await todos('cola')).length);
   $('t-version').textContent = VERSION;
@@ -808,11 +882,7 @@ $('t-desvincular').onclick = async () => {
   const pendientes = (await todos('cola')).length;
   const aviso = pendientes ? `\n\nOJO: hay ${pendientes} checadas sin enviar y se perderán.` : '';
   if (!confirm(`¿Desvincular esta tablet de Shop Car? Para volver a usarla se necesitará un código nuevo.${aviso}`)) return;
-  localStorage.removeItem('asistencia-token');
-  await tx('kv', 'readwrite', (s) => s.clear());
-  await tx('cola', 'readwrite', (s) => s.clear());
-  await tx('locales', 'readwrite', (s) => s.clear());
-  location.reload();
+  await borrarTodo('Tablet desvinculada.');
 };
 
 if ('serviceWorker' in navigator && !LOCAL) navigator.serviceWorker.register('sw.js');
@@ -820,9 +890,14 @@ if ('serviceWorker' in navigator && !LOCAL) navigator.serviceWorker.register('sw
 // ------------------------------------------------------------------ arranque
 // Al final: así todo lo de arriba ya está declarado.
 iniciarReloj();
-pintarUltimas();
-if (!token) {
-  pantalla('pantalla-vincular');
-} else {
-  abrirKiosco();
+await limpiarVectoresViejos();
+if (!revisarSinContacto()) {
+  pintarUltimas();
+  if (!token) {
+    pantalla('pantalla-vincular');
+  } else {
+    // Tablet que se actualiza desde la v1 sin marca de contacto: empieza a contar hoy.
+    if (!localStorage.getItem(CLAVE_CONTACTO)) localStorage.setItem(CLAVE_CONTACTO, String(Date.now()));
+    abrirKiosco();
+  }
 }
